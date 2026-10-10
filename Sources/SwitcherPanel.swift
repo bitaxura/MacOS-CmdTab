@@ -1,6 +1,9 @@
 import AppKit
 import ApplicationServices
 
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ wid: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 private func makeLabel(size: CGFloat, weight: NSFont.Weight, color: NSColor, lines: Int = 1) -> NSTextField {
     let lbl = NSTextField(labelWithString: "")
     lbl.font = .systemFont(ofSize: size, weight: weight)
@@ -322,52 +325,103 @@ final class SwitcherPanel: NSPanel {
     }
 
     private func closeWindow(_ item: WindowItem) {
+        guard let win = item.axWindow else { return }
         var btn: AnyObject?
         // 1. Try standard close button
-        if AXUIElementCopyAttributeValue(item.axWindow, kAXCloseButtonAttribute as CFString, &btn) == .success, let b = btn {
+        if AXUIElementCopyAttributeValue(win, kAXCloseButtonAttribute as CFString, &btn) == .success, let b = btn {
             AXUIElementPerformAction(b as! AXUIElement, kAXPressAction as CFString)
             return
         }
         // 2. Try perform close / cancel action directly on window
-        if AXUIElementPerformAction(item.axWindow, "AXClose" as CFString) != .success {
-            AXUIElementPerformAction(item.axWindow, "AXCancel" as CFString)
+        if AXUIElementPerformAction(win, "AXClose" as CFString) != .success {
+            AXUIElementPerformAction(win, "AXCancel" as CFString)
         }
     }
 
     private func activateWindow(_ item: WindowItem) {
         WindowEngine.shared.promoteToMRUFront(item)
-        let win = item.axWindow, app = item.app
+        let app = item.app
 
-        // 1. Unminimize if minimized
-        var minVal: AnyObject?
-        if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minVal) == .success, (minVal as? Bool) == true {
-            AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        // 1. Unhide application if hidden (Cmd+H)
+        if app.isHidden {
+            app.unhide()
         }
 
-        // 2. Set window focus and main attributes
-        AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(win, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        // 2. Unminimize window if minimized
+        if let win = item.axWindow {
+            var minVal: AnyObject?
+            if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minVal) == .success, (minVal as? Bool) == true {
+                AXUIElementSetAttributeValue(win, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                AXUIElementPerformAction(win, "AXPress" as CFString)
+            }
+        }
 
-        // 3. Raise the window
-        AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+        // 3. Switch spaces & make key window via WindowServer
+        WindowEngine.shared.activateWindowServer(pid: app.processIdentifier, wid: item.cgWindowID)
 
-        // 4. Set application to frontmost and activate
+        // 4. Force activate application
+        forceActivateApp(app)
+
+        // 5. Accessibility frontmost, main, and raise
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+
+        var targetAx = item.axWindow
+        if targetAx == nil && item.cgWindowID != kCGNullWindowID {
+            var axWinsVal: AnyObject?
+            if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &axWinsVal) == .success,
+               let axWins = axWinsVal as? [AXUIElement] {
+                for candidate in axWins {
+                    var cWid: CGWindowID = 0
+                    if _AXUIElementGetWindow(candidate, &cWid) == .success && cWid == item.cgWindowID {
+                        targetAx = candidate
+                        break
+                    }
+                }
+            }
+            if targetAx == nil {
+                let found = WindowEngine.shared.findAXUIElements(pid: app.processIdentifier, targetWids: [item.cgWindowID])
+                targetAx = found[item.cgWindowID]
+            }
+        }
+
+        if let win = targetAx {
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+        }
+
+        // 6. Handle parent app if applicable (helper processes)
+        if let parentApp = item.parentApp {
+            if parentApp.isHidden { parentApp.unhide() }
+            WindowEngine.shared.activateWindowServer(pid: parentApp.processIdentifier, wid: item.cgWindowID)
+            forceActivateApp(parentApp)
+            let parentEl = AXUIElementCreateApplication(parentApp.processIdentifier)
+            AXUIElementSetAttributeValue(parentEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        }
+
+        // 7. Multi-frame focus reinforcement for cross-space transitions
+        // When macOS transitions between spaces or enters/exits fullscreen, the target window
+        // must be re-raised and confirmed key as the space animation lands.
+        let targetWid = item.cgWindowID
+        let targetPid = app.processIdentifier
+        let finalAx = targetAx
+        for delay in [0.06, 0.16, 0.28] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                WindowEngine.shared.activateWindowServer(pid: targetPid, wid: targetWid)
+                self?.forceActivateApp(app)
+                if let win = finalAx {
+                    AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+                    AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+                }
+            }
+        }
+    }
+
+    private func forceActivateApp(_ app: NSRunningApplication) {
         if #available(macOS 14.0, *) {
             app.activate()
         } else {
             app.activate(options: [.activateIgnoringOtherApps])
-        }
-
-        if let parentApp = item.parentApp {
-            let parentEl = AXUIElementCreateApplication(parentApp.processIdentifier)
-            AXUIElementSetAttributeValue(parentEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-            if #available(macOS 14.0, *) {
-                parentApp.activate()
-            } else {
-                parentApp.activate(options: [.activateIgnoringOtherApps])
-            }
         }
     }
 }
